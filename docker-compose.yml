@@ -1,0 +1,14 @@
+services:
+  bet-analyzer:
+    build: .
+    container_name: bet-analyzer
+    restart: "no"
+    env_file:
+      - .env
+    networks:
+      - math_network
+
+networks:
+  math_network:
+    external: true
+    name: math-fight_default
