@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from dotenv import load_dotenv
 from bankroll import calculate_stake
@@ -12,32 +13,42 @@ API_KEY = os.getenv("ODDS_API_KEY")
 BANKROLL = float(os.getenv("BANKROLL", 1000))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", 0.25))
 
-# Konfiguration
-SPORT = "soccer_germany_bundesliga"
-URL = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds/"
-MIN_EDGE_PERCENT = 2.0  # Mindest-Vorteil in Prozent
+# Liste der zu überwachenden Ligen
+ACTIVE_SPORTS = [
+    "soccer_germany_bundesliga",
+    "soccer_germany_bundesliga2",
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+]
+
+MIN_EDGE_PERCENT = 2.0
 BENCHMARK_BOOKIE = "pinnacle"
+ALLOWED_BOOKMAKERS = ["tipico_de", "bet365", "bwin"]
 
-# Erlaubte Buchmacher (leer lassen [], um alle zuzulassen)
-ALLOWED_BOOKMAKERS = ["tipico_de"]
-
-def fetch_market_odds():
+def fetch_market_odds(sport_key):
+    """Ruft Quoten für eine spezifische Liga ab."""
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
     params = {
         "apiKey": API_KEY,
         "regions": "eu",
         "markets": "h2h",
         "oddsFormat": "decimal"
     }
-    response = requests.get(URL, params=params)
-    if response.status_code != 200:
-        print(f"Fehler beim Abruf: {response.status_code} - {response.text}")
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code != 200:
+            print(f"Fehler bei {sport_key}: {response.status_code} - {response.text}")
+            return []
+            
+        remaining = response.headers.get("x-requests-remaining")
+        print(f"[{sport_key}] Erfolgreich abgerufen. Verbleibende API-Requests: {remaining}")
+        return response.json()
+    except Exception as e:
+        print(f"Netzwerkfehler bei {sport_key}: {e}")
         return []
-        
-    print(f"Verbleibende API-Requests: {response.headers.get('x-requests-remaining')}")
-    return response.json()
 
 def extract_h2h_quotes(bookmaker_data):
-    """Extrahiert die 1X2 Quoten eines Buchmachers."""
     for market in bookmaker_data.get("markets", []):
         if market.get("key") == "h2h":
             quotes = {}
@@ -46,10 +57,13 @@ def extract_h2h_quotes(bookmaker_data):
             return quotes
     return {}
 
-def analyze_matches(matches):
-    print(f"\n--- Starte Analyse für {len(matches)} Begegnungen ---")
-    new_alerts_count = 0
-    skipped_duplicates = 0
+def analyze_matches(matches, league_name):
+    if not matches:
+        return 0, 0
+
+    print(f"Analysiere {len(matches)} Spiele in {league_name}...")
+    new_alerts = 0
+    duplicates = 0
 
     for match in matches:
         home_team = match.get("home_team")
@@ -93,19 +107,15 @@ def analyze_matches(matches):
                     fair_quote = round(1.0 / fair_prob, 2)
                     bet_hash = generate_bet_hash(match_name, bookie_title, outcome_name, quote)
 
-                    # Deduplizierung: Bereits in MariaDB vorhanden?
                     if is_bet_already_sent(bet_hash):
-                        skipped_duplicates += 1
+                        duplicates += 1
                         continue
 
-                    new_alerts_count += 1
-                    print(f"\n[NEUER VALUE BET]")
-                    print(f"Spiel: {match_name}")
-                    print(f"Buchmacher: {bookie_title} | Tipp: {outcome_name} @ {quote} (Fair: {fair_quote})")
-                    print(f"Vorteil: +{analysis['edge_percent']}% | Einsatz: {analysis['stake_euro']} €")
+                    new_alerts += 1
+                    print(f"  -> VALUE GEFUNDEN: {match_name} | {outcome_name} @ {quote} bei {bookie_title} (+{analysis['edge_percent']}%)")
 
                     alert_sent = send_discord_alert(
-                        match=match_name,
+                        match=f"[{league_name}] {match_name}",
                         bookie=bookie_title,
                         tip=outcome_name,
                         quote=quote,
@@ -125,11 +135,18 @@ def analyze_matches(matches):
                             edge=analysis["edge_percent"],
                             stake=analysis["stake_euro"]
                         )
-                        print("-> Alert gesendet und in DB registriert.")
-
-    print(f"\nDurchlauf abgeschlossen: {new_alerts_count} neue Alerts gesendet, {skipped_duplicates} bereits bekannte Wetten übersprungen.")
+    return new_alerts, duplicates
 
 if __name__ == "__main__":
-    odds_data = fetch_market_odds()
-    if odds_data:
-        analyze_matches(odds_data)
+    total_new = 0
+    total_dupes = 0
+
+    print("=== STARTE MULTI-LIGA ANALYSE ===")
+    for sport in ACTIVE_SPORTS:
+        data = fetch_market_odds(sport)
+        new, dupes = analyze_matches(data, sport)
+        total_new += new
+        total_dupes += dupes
+        time.sleep(1)  # Kurze Pause zwischen den Liga-Requests
+
+    print(f"\nDurchlauf beendet: {total_new} neue Alerts, {total_dupes} Duplikate übersprungen.")
