@@ -74,6 +74,14 @@ def init_db() -> bool:
             for col_name, col_def in REQUIRED_COLUMNS.items():
                 if col_name not in existing_cols:
                     cursor.execute(f"ALTER TABLE sent_alerts ADD COLUMN {col_name} {col_def}")
+
+            # Alt-Einträge (ohne sport_key & event_id) automatisch auf 'LEGACY' setzen,
+            # damit sie die neue 1.000-€-Statistik nicht verfälschen
+            cursor.execute("""
+                UPDATE sent_alerts
+                SET status = 'LEGACY', profit_euro = 0.00, settled_at = NULL
+                WHERE sport_key IS NULL AND event_id IS NULL AND status != 'LEGACY'
+            """)
         conn.commit()
         return True
     except Exception as e:
@@ -118,8 +126,8 @@ def is_bet_already_sent(bet_hash: str) -> bool:
 
 def is_tip_already_tracked(event_id: str, match: str, tip: str) -> bool:
     """
-    Prüft, ob für dasselbe Spiel und denselben Tipp (Ausgang) bereits eine Wette
-    in der Bankroll-Statistik platziert wurde (verhindert Doppel-Einsätze auf dasselbe Ergebnis).
+    Prüft, ob für dasselbe Spiel und denselben Tipp (Ausgang) bereits eine aktive Wette
+    in der aktuellen Bankroll-Statistik platziert wurde (verhindert Doppel-Einsätze auf dasselbe Ergebnis).
     """
     conn = get_connection()
     if not conn:
@@ -128,10 +136,10 @@ def is_tip_already_tracked(event_id: str, match: str, tip: str) -> bool:
     try:
         with conn.cursor() as cursor:
             if event_id:
-                sql = "SELECT id FROM sent_alerts WHERE event_id = %s AND tip = %s LIMIT 1"
+                sql = "SELECT id FROM sent_alerts WHERE event_id = %s AND tip = %s AND status IN ('OPEN', 'WON', 'LOST') LIMIT 1"
                 cursor.execute(sql, (event_id, tip))
             else:
-                sql = "SELECT id FROM sent_alerts WHERE match_name = %s AND tip = %s LIMIT 1"
+                sql = "SELECT id FROM sent_alerts WHERE match_name = %s AND tip = %s AND status IN ('OPEN', 'WON', 'LOST') LIMIT 1"
                 cursor.execute(sql, (match, tip))
             return cursor.fetchone() is not None
     finally:
@@ -180,15 +188,76 @@ def save_sent_bet(
         conn.close()
 
 
+def archive_legacy_bets() -> int:
+    """
+    Markiert alle Alt-Wetten (die vor dem Statistik-Upgrade ohne sport_key/event_id angelegt wurden)
+    als 'LEGACY', damit sie nicht ausgewertet werden, aber für den Duplikat-Schutz erhalten bleiben.
+    """
+    conn = get_connection()
+    if not conn:
+        return 0
+
+    try:
+        with conn.cursor() as cursor:
+            sql = """
+                UPDATE sent_alerts
+                SET status = 'LEGACY', profit_euro = 0.00, settled_at = NULL
+                WHERE sport_key IS NULL AND event_id IS NULL AND status != 'LEGACY'
+            """
+            affected = cursor.execute(sql)
+        conn.commit()
+        return affected
+    except Exception as e:
+        print(f"Fehler beim Archivieren von Alt-Wetten: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def reset_bankroll_stats(keep_open_from_today: bool = False) -> int:
+    """
+    Setzt die Bankroll-Statistik komplett zurück, sodass wir sauber bei 1.000 € starten.
+    Alle bisherigen Wetten werden auf status = 'ARCHIVED' und profit_euro = 0.00 gesetzt
+    (Duplikat-Schutz für bereits gesendete Discord-Alerts bleibt dabei aktiv).
+    Optional können heute neu angelegte, noch offene Wetten ('OPEN') aktiv bleiben.
+    """
+    conn = get_connection()
+    if not conn:
+        return 0
+
+    try:
+        with conn.cursor() as cursor:
+            if keep_open_from_today:
+                sql = """
+                    UPDATE sent_alerts
+                    SET status = 'ARCHIVED', profit_euro = 0.00, settled_at = NULL
+                    WHERE NOT (status = 'OPEN' AND sport_key IS NOT NULL)
+                """
+            else:
+                sql = """
+                    UPDATE sent_alerts
+                    SET status = 'ARCHIVED', profit_euro = 0.00, settled_at = NULL
+                    WHERE status != 'ARCHIVED'
+                """
+            affected = cursor.execute(sql)
+        conn.commit()
+        return affected
+    except Exception as e:
+        print(f"Fehler beim Zurücksetzen der Bankroll-Statistik: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
 def get_open_bets() -> list:
-    """Gibt alle noch nicht ausgewerteten Wetten (status = 'OPEN') zurück."""
+    """Gibt alle noch nicht ausgewerteten Wetten (status = 'OPEN') zurück, die aktiv getrackt werden."""
     conn = get_connection()
     if not conn:
         return []
 
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM sent_alerts WHERE status = 'OPEN'")
+            cursor.execute("SELECT * FROM sent_alerts WHERE status = 'OPEN' AND sport_key IS NOT NULL")
             return cursor.fetchall()
     except Exception as e:
         print(f"Fehler beim Laden offener Wetten: {e}")
@@ -250,7 +319,7 @@ def get_bankroll_stats(initial_bankroll: float = INITIAL_BANKROLL) -> dict:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT
-                    COUNT(*) AS total_bets,
+                    SUM(CASE WHEN status IN ('OPEN', 'WON', 'LOST') THEN 1 ELSE 0 END) AS total_bets,
                     SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_bets,
                     COALESCE(SUM(CASE WHEN status = 'OPEN' THEN stake_euro ELSE 0 END), 0) AS open_stake,
                     SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END) AS won_bets,

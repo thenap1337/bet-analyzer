@@ -1,7 +1,8 @@
 import os
+import sys
 import requests
 from dotenv import load_dotenv
-from database import get_open_bets, update_bet_result, get_bankroll_stats, init_db
+from database import get_open_bets, update_bet_result, get_bankroll_stats, init_db, reset_bankroll_stats
 from notifier import send_bankroll_summary_discord
 
 load_dotenv()
@@ -161,9 +162,17 @@ def print_bankroll_report(stats: dict):
 
 if __name__ == "__main__":
     init_db()
-    settled = settle_open_bets()
-    current_stats = get_bankroll_stats()
-    print_bankroll_report(current_stats)
-    if settled:
-        send_bankroll_summary_discord(current_stats, settled)
+    if "--reset" in sys.argv:
+        count = reset_bankroll_stats()
+        print(f"🔄 Bankroll-Statistik wurde zurückgesetzt ({count} bisherige Einträge archiviert).")
+        current_stats = get_bankroll_stats()
+        print_bankroll_report(current_stats)
+        if "--discord" in sys.argv:
+            send_bankroll_summary_discord(current_stats)
+    else:
+        settled = settle_open_bets()
+        current_stats = get_bankroll_stats()
+        print_bankroll_report(current_stats)
+        if settled or "--discord" in sys.argv:
+            send_bankroll_summary_discord(current_stats, settled)
 
